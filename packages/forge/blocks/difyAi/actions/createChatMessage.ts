@@ -3,8 +3,9 @@ import { isDefined, isEmpty, isNotEmpty } from '@typebot.io/lib'
 import { auth } from '../auth'
 import { defaultBaseUrl } from '../constants'
 import { Chunk } from '../types'
-import ky from 'ky'
+import ky, { HTTPError } from 'ky'
 import { deprecatedCreateChatMessageOptions } from '../deprecated'
+import { formatStreamPart } from 'ai'
 
 export const createChatMessage = createAction({
   auth,
@@ -29,9 +30,20 @@ export const createChatMessage = createAction({
         moreInfoTooltip:
           'The user identifier, defined by the developer, must ensure uniqueness within the app.',
       }),
-      inputs: option.keyValueList.layout({
-        accordion: 'Inputs',
-      }),
+      inputs: option
+        .array(
+          option.object({
+            key: option.string.layout({
+              label: 'Key',
+            }),
+            value: option.string.layout({
+              label: 'Value',
+            }),
+          })
+        )
+        .layout({
+          accordion: 'Inputs',
+        }),
       responseMapping: option
         .saveResponseArray(
           ['Answer', 'Conversation ID', 'Total Tokens'] as const,
@@ -68,77 +80,100 @@ export const createChatMessage = createAction({
         const existingDifyConversationId = conversationVariableId
           ? variables.get(conversationVariableId)
           : conversation_id
-        const response = await ky(
-          (apiEndpoint ?? defaultBaseUrl) + '/v1/chat-messages',
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              inputs:
-                inputs?.reduce((acc, { key, value }) => {
-                  if (isEmpty(key) || isEmpty(value)) return acc
-                  return {
-                    ...acc,
-                    [key]: value,
-                  }
-                }, {}) ?? {},
-              query,
-              response_mode: 'streaming',
-              conversation_id: existingDifyConversationId,
-              user,
-              files: [],
+        try {
+          const response = await ky(
+            (apiEndpoint ?? defaultBaseUrl) + '/v1/chat-messages',
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                inputs:
+                  inputs?.reduce((acc, { key, value }) => {
+                    if (isEmpty(key) || isEmpty(value)) return acc
+                    return {
+                      ...acc,
+                      [key]: value,
+                    }
+                  }, {}) ?? {},
+                query,
+                response_mode: 'streaming',
+                conversation_id: existingDifyConversationId,
+                user,
+                files: [],
+              }),
+            }
+          )
+          const reader = response.body?.getReader()
+
+          if (!reader) return {}
+
+          return {
+            stream: new ReadableStream({
+              async start(controller) {
+                try {
+                  await processDifyStream(reader, {
+                    onDone: () => {
+                      controller.close()
+                    },
+                    onMessage: (message) => {
+                      controller.enqueue(
+                        new TextEncoder().encode(
+                          formatStreamPart('text', message)
+                        )
+                      )
+                    },
+                    async onMessageEnd({ totalTokens, conversationId }) {
+                      if (
+                        conversationVariableId &&
+                        isNotEmpty(conversationId) &&
+                        isEmpty(existingDifyConversationId?.toString())
+                      )
+                        await variables.set(
+                          conversationVariableId,
+                          conversationId
+                        )
+
+                      if ((responseMapping?.length ?? 0) === 0) return
+                      for (const mapping of responseMapping ?? []) {
+                        if (!mapping.variableId) continue
+
+                        if (
+                          mapping.item === 'Conversation ID' &&
+                          isNotEmpty(conversationId) &&
+                          isEmpty(existingDifyConversationId?.toString())
+                        )
+                          await variables.set(
+                            mapping.variableId,
+                            conversationId
+                          )
+
+                        if (mapping.item === 'Total Tokens')
+                          await variables.set(mapping.variableId, totalTokens)
+                      }
+                    },
+                  })
+                } catch (e) {
+                  console.error(e)
+                  controller.error(e) // Properly closing the stream with an error
+                }
+              },
             }),
           }
-        )
-        const reader = response.body?.getReader()
-
-        if (!reader) return
-
-        return new ReadableStream({
-          async start(controller) {
-            try {
-              await processDifyStream(reader, {
-                onDone: () => {
-                  controller.close()
-                },
-                onMessage: (message) => {
-                  controller.enqueue(
-                    new TextEncoder().encode('0:"' + message + '"\n')
-                  )
-                },
-                onMessageEnd({ totalTokens, conversationId }) {
-                  if (
-                    conversationVariableId &&
-                    isNotEmpty(conversationId) &&
-                    isEmpty(existingDifyConversationId?.toString())
-                  )
-                    variables.set(conversationVariableId, conversationId)
-
-                  if ((responseMapping?.length ?? 0) === 0) return
-                  responseMapping?.forEach((mapping) => {
-                    if (!mapping.variableId) return
-
-                    if (
-                      mapping.item === 'Conversation ID' &&
-                      isNotEmpty(conversationId) &&
-                      isEmpty(existingDifyConversationId?.toString())
-                    )
-                      variables.set(mapping.variableId, conversationId)
-
-                    if (mapping.item === 'Total Tokens')
-                      variables.set(mapping.variableId, totalTokens)
-                  })
-                },
-              })
-            } catch (e) {
-              console.error(e)
-              controller.error(e) // Properly closing the stream with an error
+        } catch (err) {
+          if (err instanceof HTTPError) {
+            return {
+              httpError: {
+                status: err.response.status,
+                message: await err.response.text(),
+              },
             }
-          },
-        })
+          }
+          console.error(err)
+          return {}
+        }
       },
     },
     server: async ({
@@ -206,7 +241,10 @@ export const createChatMessage = createAction({
               onMessage: (message) => {
                 answer += message
               },
-              onMessageEnd: ({ totalTokens: tokens, conversationId: id }) => {
+              onMessageEnd: async ({
+                totalTokens: tokens,
+                conversationId: id,
+              }) => {
                 totalTokens = tokens
                 conversationId = id
               },
@@ -243,12 +281,15 @@ export const createChatMessage = createAction({
           if (item === 'Total Tokens')
             variables.set(mapping.variableId, totalTokens)
         })
-      } catch (error) {
-        logs.add({
-          status: 'error',
-          description: 'Failed to create chat message',
-        })
-        console.error(error)
+      } catch (err) {
+        if (err instanceof HTTPError) {
+          return logs.add({
+            status: 'error',
+            description: err.message,
+            details: await err.response.text(),
+          })
+        }
+        console.error(err)
       }
     },
   },
@@ -268,9 +309,9 @@ const processDifyStream = async (
       totalTokens,
       conversationId,
     }: {
-      totalTokens: number
+      totalTokens?: number
       conversationId: string
-    }) => void
+    }) => Promise<void>
   }
 ) => {
   let jsonChunk = ''
@@ -285,27 +326,27 @@ const processDifyStream = async (
     const chunk = new TextDecoder().decode(value)
 
     const lines = chunk.toString().split('\n') as string[]
-    lines
-      .filter((line) => line.length > 0 && line !== '\n')
-      .forEach((line) => {
-        jsonChunk += line
-        if (jsonChunk.startsWith('event: ')) {
-          jsonChunk = ''
-          return
-        }
-        if (!jsonChunk.startsWith('data: ') || !jsonChunk.endsWith('}')) return
-
-        const data = JSON.parse(jsonChunk.slice(6)) as Chunk
+    for (const line of lines.filter(
+      (line) => line.length > 0 && line !== '\n'
+    )) {
+      jsonChunk += line
+      if (jsonChunk.startsWith('event: ')) {
         jsonChunk = ''
-        if (data.event === 'message' || data.event === 'agent_message') {
-          callbacks.onMessage(data.answer)
-        }
-        if (data.event === 'message_end') {
-          callbacks.onMessageEnd?.({
-            totalTokens: data.metadata.usage.total_tokens,
-            conversationId: data.conversation_id,
-          })
-        }
-      })
+        continue
+      }
+      if (!jsonChunk.startsWith('data: ') || !jsonChunk.endsWith('}')) continue
+
+      const data = JSON.parse(jsonChunk.slice(6)) as Chunk
+      jsonChunk = ''
+      if (data.event === 'message' || data.event === 'agent_message') {
+        callbacks.onMessage(data.answer)
+      }
+      if (data.event === 'message_end') {
+        await callbacks.onMessageEnd?.({
+          totalTokens: data.metadata.usage?.total_tokens,
+          conversationId: data.conversation_id,
+        })
+      }
+    }
   }
 }

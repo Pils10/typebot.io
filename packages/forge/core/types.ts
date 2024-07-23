@@ -13,6 +13,10 @@ export type VariableStore = {
   }[]
 }
 
+export type AsyncVariableStore = Omit<VariableStore, 'set'> & {
+  set: (variableId: string, value: unknown) => Promise<void>
+}
+
 export type LogsStore = {
   add: (
     log:
@@ -63,8 +67,11 @@ export type ActionDefinition<
       run: (params: {
         credentials: CredentialsFromAuthDef<A>
         options: z.infer<BaseOptions> & z.infer<Options>
-        variables: VariableStore
-      }) => Promise<ReadableStream<any> | undefined>
+        variables: AsyncVariableStore
+      }) => Promise<{
+        stream?: ReadableStream<any>
+        httpError?: { status: number; message: string }
+      }>
     }
     web?: {
       displayEmbedBubble?: {
@@ -133,6 +140,10 @@ export type BlockDefinition<
   LightLogo: (props: SVGProps<SVGSVGElement>) => JSX.Element
   DarkLogo?: (props: SVGProps<SVGSVGElement>) => JSX.Element
   docsUrl?: string
+  onboarding?: {
+    deployedAt: Date
+    youtubeId: string
+  }
   auth?: Auth
   options?: Options | undefined
   fetchers?: FetcherDefinition<Auth, Options>[]
